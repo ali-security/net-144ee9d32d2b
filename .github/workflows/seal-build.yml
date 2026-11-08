@@ -1,0 +1,116 @@
+name: seal-build
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional go test package/flag selector; empty runs the full suite (./...)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    name: module-zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'   # only builds the x/mod zip helper; the module itself is tested below on its contemporary Go
+          cache: false
+      - name: Build x/mod zip helper (outside the checkout)
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/main.go"
+          cd "$HELPER"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+      - name: Pack module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          # The sealing workflow + helper must not ship in the module zip (upstream has no .github).
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" golang.org/x/net v0.0.0-20210224082022-3d97a244fca7 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.0.0-20210224082022-3d97a244fca7.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.0.0-20210224082022-3d97a244fca7.zip" | tail -n 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.0.0-20210224082022-3d97a244fca7.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go: '1.16'
+            testflags: ''
+          - os: windows-latest
+            go: '1.16'
+            testflags: ''
+          - os: macos-latest
+            go: '1.23'   # macos-latest arm64 linker needs LC_UUID (Go >=1.23); older Go aborts (signal abort trap)
+            testflags: '-ldflags=-checklinkname=0'   # Go 1.23 linkname enforcement escape for internal/socket syscall.recvmsg (flag only exists in Go >=1.23)
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Build
+        run: |
+          set -eux
+          go version
+          go build ${{ matrix.testflags }} ./...
+      - name: Provide gohttp2/curl image for http2 curl integration tests
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          # http2/http2_test.go runs `docker run --net=host gohttp2/curl ...` (an HTTP/2-capable
+          # curl; upstream's http2/Dockerfile builds it on ubuntu:trusty, which no longer builds).
+          # Supply an equivalent HTTP/2 curl under that tag so TestServerWithCurl* run instead of skip.
+          printf 'FROM curlimages/curl:8.11.1\nENTRYPOINT ["/usr/bin/curl"]\nCMD ["-h"]\n' | docker build -t gohttp2/curl -
+          docker run --rm gohttp2/curl --version
+          # icmp TestConcurrentNonPrivilegedListenPacket needs unprivileged ICMP sockets (its own skip hint).
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+      - name: Test
+        run: |
+          set -euo pipefail
+          go test -v ${{ matrix.testflags }} ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+      - name: Test summary
+        if: always()
+        run: |
+          # Lists every skipped test together with the t.Skip reason go test -v printed for it.
+          # The one message-less skip, http2 TestSpecCoverage, is gated on the opt-in -coverspec flag
+          # (http2/z_spec_test.go:284); TestServerWithH2Load needs -h2load and TestTransportExternal
+          # needs -extnet (both opt-in network/benchmark tests upstream never runs by default).
+          LC_ALL=C awk '
+            {sub(/\r$/, "")}
+            /^=== RUN/ {cur=$3; why[cur]=""; next}
+            /^=== CONT/ {cur=$3; next}
+            /^=== PAUSE/ {next}
+            /^[ \t]+[A-Za-z0-9_]+\.go:[0-9]+:/ {m=$0; sub(/^[ \t]+/, "", m); why[cur] = (why[cur]=="" ? m : why[cur] " | " m); next}
+            /^ok[ \t]/ {okp++}
+            /^FAIL[ \t]/ {failp++}
+            /^\?[ \t]/ {notest++}
+            /--- PASS:/ {pass++}
+            /--- FAIL:/ {fail++; n=$3; print "FAILED: " n "  output: " why[n]}
+            /--- SKIP:/ {skip++; n=$3; r=why[n]; if (r ~ /:[0-9]+:[ \t]*$/) r = r " (t.Skip() without message: opt-in -coverspec flag not set)"; print "SKIPPED: " n "  reason: " r}
+            END {printf "TEST SUMMARY: %d passed, %d failed, %d skipped; packages: %d ok, %d FAIL, %d no test files\n", pass, fail, skip, okp, failp, notest}
+          ' "$RUNNER_TEMP/go-test.log"
